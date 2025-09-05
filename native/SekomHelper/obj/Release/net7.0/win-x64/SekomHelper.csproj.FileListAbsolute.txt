@@ -1,0 +1,14 @@
+D:\Program Files\sekom_clenner\native\SekomHelper\bin\Release\net7.0\win-x64\SekomHelper.exe
+D:\Program Files\sekom_clenner\native\SekomHelper\bin\Release\net7.0\win-x64\SekomHelper.deps.json
+D:\Program Files\sekom_clenner\native\SekomHelper\bin\Release\net7.0\win-x64\SekomHelper.runtimeconfig.json
+D:\Program Files\sekom_clenner\native\SekomHelper\bin\Release\net7.0\win-x64\SekomHelper.dll
+D:\Program Files\sekom_clenner\native\SekomHelper\bin\Release\net7.0\win-x64\SekomHelper.pdb
+D:\Program Files\sekom_clenner\native\SekomHelper\obj\Release\net7.0\win-x64\SekomHelper.GeneratedMSBuildEditorConfig.editorconfig
+D:\Program Files\sekom_clenner\native\SekomHelper\obj\Release\net7.0\win-x64\SekomHelper.AssemblyInfoInputs.cache
+D:\Program Files\sekom_clenner\native\SekomHelper\obj\Release\net7.0\win-x64\SekomHelper.AssemblyInfo.cs
+D:\Program Files\sekom_clenner\native\SekomHelper\obj\Release\net7.0\win-x64\SekomHelper.csproj.CoreCompileInputs.cache
+D:\Program Files\sekom_clenner\native\SekomHelper\obj\Release\net7.0\win-x64\SekomHelper.dll
+D:\Program Files\sekom_clenner\native\SekomHelper\obj\Release\net7.0\win-x64\refint\SekomHelper.dll
+D:\Program Files\sekom_clenner\native\SekomHelper\obj\Release\net7.0\win-x64\SekomHelper.pdb
+D:\Program Files\sekom_clenner\native\SekomHelper\obj\Release\net7.0\win-x64\SekomHelper.genruntimeconfig.cache
+D:\Program Files\sekom_clenner\native\SekomHelper\obj\Release\net7.0\win-x64\ref\SekomHelper.dll
