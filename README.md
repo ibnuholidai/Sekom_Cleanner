@@ -1,5 +1,6 @@
-# Sekom Cleaner (sekom_clenner)
 
+
+# Sekom Cleaner (sekom_clenner)
 Alat pembersih sistem dan utilitas desktop untuk Windows yang membantu teknisi/administrator membersihkan data browser, folder sistem, jejak recent, serta menyediakan pintasan ke beberapa pengaturan Windows. Aplikasi ini juga menyertakan panel Testing untuk pengujian perangkat (keyboard, audio L/R, layar/RGB), serta helper native untuk beberapa operasi sistem.
 
 ## Fitur Utama
