@@ -1,0 +1,2 @@
+D:\Program Files\sekom_clenner\native\publish\SekomHelper.pdb
+D:\Program Files\sekom_clenner\native\publish\SekomHelper.exe
