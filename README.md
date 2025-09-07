@@ -1,3 +1,19 @@
+<<<<<<< HEAD
+=======
+<img width="1920" height="1036" alt="Image" src="https://github.com/user-attachments/assets/40a6339c-44d8-471f-8a74-2d1d3f46c1e0" />
+
+<img width="1920" height="1041" alt="Image" src="https://github.com/user-attachments/assets/ee551d38-6056-454b-90cb-a2d55951a1dc" />
+
+<img width="1920" height="1042" alt="Image" src="https://github.com/user-attachments/assets/2cbc3b86-1cf0-4f57-933c-61c859aa0b16" />
+
+<img width="1920" height="1047" alt="Image" src="https://github.com/user-attachments/assets/a6d0f07b-0152-40db-8cb2-01a970a4a2ea" />
+
+<img width="1920" height="1036" alt="Image" src="https://github.com/user-attachments/assets/8fe78f9f-60c6-4322-99a1-4a3286a04e0d" />
+
+<img width="1920" height="1032" alt="Image" src="https://github.com/user-attachments/assets/3c940235-8bc5-4188-9e2c-b05900117612" />
+
+# Sekom Cleaner (sekom_clenner)
+>>>>>>> 542eebb5def035174505e2c20e4c7a285cfa8cd5
 
 
 # Sekom Cleaner (sekom_clenner)
