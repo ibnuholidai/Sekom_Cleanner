@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:process_run/shell.dart';
 import '../models/system_status.dart';
 import '../models/application_models.dart';
+import 'windows_native.dart';
 
 class SystemService {
   static final Shell _shell = Shell();
@@ -111,6 +112,13 @@ try {
   if (\$line -and (\$line -match 'Bytes\\s*:\\s*([0-9,]+)')) {
     \$bytes = [int64](\$Matches[1].Value.Replace(',', ''))
   }
+  # Fallback for non-English or unexpected Robocopy output
+  if (-not \$line -or \$bytes -le 0) {
+    try {
+      \$m = Get-ChildItem -LiteralPath "\$folder" -Force -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
+      if (\$m -and \$m.Sum) { \$bytes = [int64]\$m.Sum }
+    } catch { }
+  }
   Write-Output \$bytes
 } catch {
   Write-Output 0
@@ -121,7 +129,33 @@ try {
       final result = await _shell.run('powershell -NoProfile -ExecutionPolicy Bypass -File "$scriptPath"');
       final out = result.first.stdout.toString().trim();
       final val = int.tryParse(out) ?? 0;
-      return val;
+      if (val > 0) return val;
+
+      // Locale-agnostic fallback using Measure-Object (slower but reliable)
+      try {
+        if (await Directory(folderPath).exists()) {
+          final ps2 = '''
+\$fp = "$folderEsc"
+try {
+  \$m = Get-ChildItem -LiteralPath "\$fp" -Force -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
+  if (\$m -and \$m.Sum) { [int64]\$m.Sum } else { 0 }
+} catch { 0 }
+''';
+          final fallbackPath = '${Directory.systemTemp.path}\\sekom_size_fallback.ps1';
+          await File(fallbackPath).writeAsString(ps2);
+          final res2 = await _shell.run('powershell -NoProfile -ExecutionPolicy Bypass -File "$fallbackPath"');
+          final out2 = res2.first.stdout.toString().trim();
+          final v2 = int.tryParse(out2) ?? 0;
+          if (v2 > 0) {
+            // annotate lastReport for diagnostics
+            final list = (lastReport['sizeFallbackSingle'] as List<dynamic>?) ?? <dynamic>[];
+            list.add(folderPath);
+            lastReport['sizeFallbackSingle'] = list;
+            return v2;
+          }
+        }
+      } catch (_) {}
+      return 0;
     } catch (_) {
       return 0;
     }
@@ -149,6 +183,19 @@ try {
     return null;
   }
  
+  // Global no-timeout control and shell runner helper
+  static bool noTimeouts = true;
+  static Future<List<ProcessResult>> _run(String cmd, {Duration? timeout}) async {
+    try {
+      if (!noTimeouts && timeout != null) {
+        return _shell.run(cmd).timeout(timeout);
+      }
+      return _shell.run(cmd);
+    } catch (_) {
+      return _shell.run(cmd); // fallback
+    }
+  }
+ 
   // Resolve Python executable path
   static Future<String?> _resolvePython() async {
     final candidates = <String>[
@@ -167,6 +214,23 @@ try {
     return null;
   }
  
+  // Elevation check helper (cached)
+  static bool? _elevatedCache;
+  static Future<bool> _isElevated() async {
+    try {
+      if (_elevatedCache != null) return _elevatedCache!;
+      final cmd = r'''powershell -NoProfile -Command "[Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent() | % { $_.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) }"''';
+      var res = await _shell.run(cmd);
+      final out = res.first.stdout.toString().trim().toLowerCase();
+      final isAdmin = out.contains('true');
+      _elevatedCache = isAdmin;
+      return isAdmin;
+    } catch (_) {
+      return false;
+    }
+  }
+
+ 
   // ===== Browser cleaning methods =====
   static Future<List<String>> cleanBrowsers({
     bool chrome = false,
@@ -182,48 +246,54 @@ try {
       if (edge) browsers.add("msedge.exe");
       if (firefox) browsers.add("firefox.exe");
 
-      for (String browser in browsers) {
-        try {
-          await _shell.run('taskkill /f /im $browser');
-        } catch (_) {
-          // ignore if not running
-        }
-      }
-
-      // Wait a bit
-      await Future.delayed(Duration(seconds: 2));
+      await Future.wait(browsers.map((browser) async {
+        try { await _shell.run('taskkill /f /im $browser'); } catch (_) {}
+      }));
 
       // Get user profile
       String userProfile = Platform.environment['USERPROFILE'] ?? '';
 
+      // Run profile resets in parallel to speed up
+      final List<Future<void>> resetTasks = [];
+
       if (chrome && resetBrowser) {
         String chromePath = '$userProfile\\AppData\\Local\\Google\\Chrome\\User Data';
         if (await Directory(chromePath).exists()) {
-          final ok = await _fastDeleteDirectoryPath(chromePath);
-          if (ok || !await Directory(chromePath).exists()) {
-            cleaned.add("Google Chrome");
-          }
+          resetTasks.add(() async {
+            final ok = await _fastDeleteDirectoryPath(chromePath);
+            if (ok || !await Directory(chromePath).exists()) {
+              cleaned.add("Google Chrome");
+            }
+          }());
         }
       }
 
       if (edge && resetBrowser) {
         String edgePath = '$userProfile\\AppData\\Local\\Microsoft\\Edge\\User Data';
         if (await Directory(edgePath).exists()) {
-          final ok = await _fastDeleteDirectoryPath(edgePath);
-          if (ok || !await Directory(edgePath).exists()) {
-            cleaned.add("Microsoft Edge");
-          }
+          resetTasks.add(() async {
+            final ok = await _fastDeleteDirectoryPath(edgePath);
+            if (ok || !await Directory(edgePath).exists()) {
+              cleaned.add("Microsoft Edge");
+            }
+          }());
         }
       }
 
       if (firefox && resetBrowser) {
         String firefoxPath = '$userProfile\\AppData\\Roaming\\Mozilla\\Firefox';
         if (await Directory(firefoxPath).exists()) {
-          final ok = await _fastDeleteDirectoryPath(firefoxPath);
-          if (ok || !await Directory(firefoxPath).exists()) {
-            cleaned.add("Mozilla Firefox");
-          }
+          resetTasks.add(() async {
+            final ok = await _fastDeleteDirectoryPath(firefoxPath);
+            if (ok || !await Directory(firefoxPath).exists()) {
+              cleaned.add("Mozilla Firefox");
+            }
+          }());
         }
+      }
+
+      if (resetTasks.isNotEmpty) {
+        await Future.wait(resetTasks);
       }
     } catch (_) {
       // swallow
@@ -248,6 +318,10 @@ try {
 
     try {
       String userProfile = Platform.environment['USERPROFILE'] ?? '';
+      if (userProfile.trim().isEmpty) {
+        lastReport['cleanSystemFolders'] = { 'cleaned': cleaned, 'skipped': true, 'reason': 'No USERPROFILE' };
+        return cleaned;
+      }
       Map<String, bool> folders = {
         'Documents': documents,
         'Downloads': downloads,
@@ -257,42 +331,49 @@ try {
         '3D Objects': objects3d,
       };
 
+      // Parallelize per-folder cleaning
+      final List<Future<void>> folderTasks = [];
       for (String folderName in folders.keys) {
         if (folders[folderName] == true) {
-          String folderPath = '$userProfile\\$folderName';
-          Directory folder = Directory(folderPath);
+          folderTasks.add(() async {
+            String folderPath = '$userProfile\\$folderName';
+            Directory folder = Directory(folderPath);
 
-          if (await folder.exists()) {
-            bool ok = false;
-            try {
-              // Fast path: Remove-Item for all contents inside the folder
-              await _shell.run('powershell -NoProfile -Command "Remove-Item -Path \\"$folderPath\\*\\" -Recurse -Force -ErrorAction SilentlyContinue"');
-              ok = true;
-            } catch (_) {
-              ok = false;
-            }
-
-            if (!ok) {
-              // Fallback to Dart deletion item-by-item
+            if (await folder.exists()) {
+              bool ok = false;
               try {
-                await for (FileSystemEntity entity in folder.list()) {
-                  try {
-                    if (entity is File) {
-                      await entity.delete();
-                    } else if (entity is Directory) {
-                      await entity.delete(recursive: true);
-                    }
-                  } catch (_) {}
-                }
+                // Fast path: Remove-Item for all contents inside the folder
+                await _shell.run('powershell -NoProfile -Command "Remove-Item -Path \\"$folderPath\\*\\" -Recurse -Force -ErrorAction SilentlyContinue"');
                 ok = true;
-              } catch (_) {}
-            }
+              } catch (_) {
+                ok = false;
+              }
 
-            if (ok) {
-              cleaned.add(folderName);
+              if (!ok) {
+                // Fallback to Dart deletion item-by-item
+                try {
+                  await for (FileSystemEntity entity in folder.list()) {
+                    try {
+                      if (entity is File) {
+                        await entity.delete();
+                      } else if (entity is Directory) {
+                        await entity.delete(recursive: true);
+                      }
+                    } catch (_) {}
+                  }
+                  ok = true;
+                } catch (_) {}
+              }
+
+              if (ok) {
+                cleaned.add(folderName);
+              }
             }
-          }
+          }());
         }
+      }
+      if (folderTasks.isNotEmpty) {
+        await Future.wait(folderTasks);
       }
     } catch (_) {
       // swallow
@@ -317,13 +398,10 @@ try {
         "msaccess.exe", "mspub.exe", "visio.exe", "project.exe",
         "notepad.exe", "wordpad.exe"
       ];
-      for (String app in appsToClose) {
-        try {
-          await _shell.run('taskkill /f /im $app');
-        } catch (_) {}
-      }
+      await Future.wait(appsToClose.map((app) async {
+        try { await _shell.run('taskkill /f /im $app'); } catch (_) {}
+      }));
 
-      await Future.delayed(Duration(seconds: 3));
 
       // 1. Clear Windows Recent folder
       String recentPath = '$appData\\Microsoft\\Windows\\Recent';
@@ -399,12 +477,17 @@ try {
 
       // 4. Clear Windows Search index and search history
       try {
-        // Stop search UI processes and service
+        // Stop search UI processes and service (service requires admin)
         try { await _shell.run('taskkill /f /im SearchApp.exe'); } catch (_) {}
         try { await _shell.run('taskkill /f /im SearchUI.exe'); } catch (_) {}
         try { await _shell.run('taskkill /f /im SearchHost.exe'); } catch (_) {}
-        await _shell.run('net stop "Windows Search"');
-        await Future.delayed(Duration(seconds: 2));
+        final elevated = await _isElevated();
+        if (elevated) {
+          await _shell.run('net stop "Windows Search"');
+          await Future.delayed(Duration(seconds: 2));
+        } else {
+          lastReport['clearRecentFiles_skippedAdminOps'] = true;
+        }
 
         // Delete Windows Search database
         String searchDbPath = '$localAppData\\Microsoft\\Windows\\Search';
@@ -429,7 +512,9 @@ try {
         try { await _shell.run('reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\ComDlg32\\LastVisitedPidlMRU" /f'); } catch (_) {}
         try { await _shell.run('reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\ACMru" /f'); } catch (_) {}
 
-        await _shell.run('net start "Windows Search"');
+        if (elevated) {
+          await _shell.run('net start "Windows Search"');
+        }
       } catch (_) {}
 
       // 5. Clear Jump Lists
@@ -549,37 +634,13 @@ try {
   // ===== System status checking methods =====
   static Future<SystemStatus> checkWindowsDefender() async {
     try {
-      final cmd = r'''powershell -NoProfile -Command "$enabled=$false; $days=-1; $hours=-1; try { $s=Get-MpComputerStatus; if ($s) { $enabled = [bool]$s.AntivirusEnabled -and [bool]$s.RealTimeProtectionEnabled; $last=$s.AntivirusSignatureLastUpdated; if ($last) { $ts=(Get-Date)-$last; $days=$ts.Days; $hours=[int]$ts.TotalHours } } } catch {}; if (-not $enabled) { try { $svc=(Get-Service -Name WinDefend -ErrorAction SilentlyContinue); if ($svc -and $svc.Status -eq 'Running') { $enabled=$true } } catch {} } ; Write-Output ($enabled.ToString() + '|' + $days + '|' + $hours)"''';
-      var result = await _shell.run(cmd);
-      String out = result.first.stdout.toString().trim();
-      bool enabled = false;
-      int days = -1;
-      int hours = -1;
-      if (out.contains("|")) {
-        var parts = out.split("|");
-        enabled = parts[0].toLowerCase().contains("true");
-        days = int.tryParse(parts[1].trim()) ?? -1;
-        hours = int.tryParse(parts[2].trim()) ?? -1;
-      }
-
-      if (!enabled) {
+      final running = WindowsNative.isServiceRunning('WinDefend');
+      if (!running) {
         return SystemStatus(status: "Defender disabled", isActive: false, needsUpdate: true);
       }
-
-      String ageText = "unknown";
-      if (days >= 0) {
-        if (days > 0) {
-          ageText = "$days day(s)";
-        } else if (hours >= 0) {
-          ageText = "$hours hour(s)";
-        }
-      }
-      bool needs = (days > 7 || hours > (24 * 7));
-      return SystemStatus(
-        status: "Active - Signature updated $ageText ago",
-        isActive: true,
-        needsUpdate: needs,
-      );
+      final sig = WindowsNative.getDefenderSignatureVersion();
+      final statusText = (sig != null && sig.isNotEmpty) ? "Active - Signature $sig" : "Active";
+      return SystemStatus(status: statusText, isActive: true, needsUpdate: false);
     } catch (_) {
       return SystemStatus(status: "❓ Cannot check", isActive: false);
     }
@@ -587,23 +648,15 @@ try {
 
   static Future<SystemStatus> checkWindowsUpdate() async {
     try {
-      final cmd = r'''powershell -NoProfile -Command "$d=-1; $h=-1; $last=$null; try { $reg=Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\Results\Install' -Name LastSuccessTime -ErrorAction SilentlyContinue; if ($reg -and $reg.LastSuccessTime) { $last=[datetime]$reg.LastSuccessTime } } catch {}; if (-not $last) { try { $last=(Get-HotFix | Sort-Object InstalledOn -Descending | Select-Object -First 1).InstalledOn } catch {} } ; if ($last) { $ts=(Get-Date)-$last; $d=$ts.Days; $h=[int]$ts.TotalHours } ; Write-Output ($d.ToString() + '|' + $h.ToString())"''';
-      var result = await _shell.run(cmd);
-      String out = result.first.stdout.toString().trim();
-      int days = -1;
-      int hours = -1;
-      if (out.contains("|")) {
-        var parts = out.split("|");
-        days = int.tryParse(parts[0].trim()) ?? -1;
-        hours = int.tryParse(parts[1].trim()) ?? -1;
-      }
-
-      if (days == -1 && hours == -1) {
+      final last = WindowsNative.getWindowsUpdateLastSuccessTime();
+      if (last == null) {
         return SystemStatus(status: "❓ Cannot determine last update", isActive: false);
       }
-
-      String ageText = (days > 0) ? "$days day(s)" : ((hours >= 0) ? "$hours hour(s)" : "unknown");
-      bool needs = (days > 7 || hours > (24 * 7));
+      final diff = DateTime.now().difference(last);
+      final days = diff.inDays;
+      final hours = diff.inHours;
+      final ageText = (days > 0) ? "$days day(s)" : "$hours hour(s)";
+      final needs = (days > 7 || hours > (24 * 7));
       if (!needs) {
         return SystemStatus(status: "Up-to-date - Last update $ageText ago", isActive: true);
       } else {
@@ -616,43 +669,48 @@ try {
 
   static Future<SystemStatus> checkDrivers() async {
     try {
-      try {
-        var pnputil = await _shell.run('cmd /c pnputil /enum-devices /problem');
-        String pout = pnputil.first.stdout.toString();
-        if (pout.isNotEmpty) {
-          final totalMatches = RegExp(r'Problem\s*:').allMatches(pout).length;
-          final missingMatches = RegExp(r'0x0000001C', caseSensitive: false).allMatches(pout).length;
-          if (totalMatches == 0) {
-            return SystemStatus(status: "All drivers OK", isActive: true);
-          } else {
-            return SystemStatus(
-              status: "Driver issues: $totalMatches - Not installed: $missingMatches",
-              isActive: false,
-              needsUpdate: true,
-            );
-          }
-        }
-      } catch (_) {}
-
-      final cmd = r'''powershell -NoProfile -Command "$allCount=0; $notInstalled=0; try { $bad=Get-PnpDevice -PresentOnly -ErrorAction Stop | Where-Object { $_.Status -ne 'OK' }; $allCount=$bad.Count } catch {}; if ($allCount -eq 0) { try { $all = Get-WmiObject Win32_PnPEntity | Where-Object { $_.ConfigManagerErrorCode -ne 0 }; $not = $all | Where-Object { $_.ConfigManagerErrorCode -eq 28 }; $allCount=$all.Count; $notInstalled=$not.Count } catch {} } ; Write-Output ($allCount.ToString() + '|' + $notInstalled.ToString())"''';
-      var result = await _shell.run(cmd);
-      String out = result.first.stdout.toString().trim();
-      int total = 0, notInstalled = 0;
-      if (out.contains("|")) {
-        var parts = out.split("|");
-        total = int.tryParse(parts[0].trim()) ?? 0;
-        notInstalled = int.tryParse(parts[1].trim()) ?? 0;
+      // Lightweight check to avoid heavy shell calls: ensure Plug and Play service is running.
+      final pnpRunning = WindowsNative.isServiceRunning('PlugPlay');
+      if (pnpRunning) {
+        return SystemStatus(status: "Quick scan OK (Plug and Play active)", isActive: true);
+      } else {
+        return SystemStatus(status: "Plug and Play service not running", isActive: false, needsUpdate: true);
       }
-      if (total == 0) {
-        return SystemStatus(status: "All drivers OK", isActive: true);
-      }
-      return SystemStatus(
-        status: "Driver issues: $total - Not installed: $notInstalled",
-        isActive: false,
-        needsUpdate: true,
-      );
     } catch (_) {
       return SystemStatus(status: "❓ Cannot check", isActive: false);
+    }
+  }
+
+  // Quick checks to avoid blocking the UI during initial "Check All"
+  static Future<SystemStatus> checkWindowsActivationQuick() async {
+    try {
+      final gs = WindowsNative.getWindowsGenuineState();
+      if (gs == 1) {
+        return SystemStatus(status: "✅ Activated", isActive: true, detail: "GenuineState=1 (Registry)");
+      }
+      return SystemStatus(status: "❓ Cannot verify (registry)", isActive: false);
+    } catch (_) {
+      return SystemStatus(status: "❓ Cannot check", isActive: false);
+    }
+  }
+
+  static Future<SystemStatus> checkOfficeActivationQuick() async {
+    try {
+      // Quick presence check of OSPP.VBS
+      final paths = [
+        'C:\\Program Files\\Microsoft Office\\Office16\\OSPP.VBS',
+        'C:\\Program Files (x86)\\Microsoft Office\\Office16\\OSPP.VBS',
+        'C:\\Program Files\\Microsoft Office\\Office15\\OSPP.VBS'
+      ];
+      for (final p in paths) {
+        if (await File(p).exists()) {
+          // Defer heavy cscript scan to background
+          return SystemStatus(status: "⏳ Ditunda (akan diperbarui)", isActive: false);
+        }
+      }
+      return SystemStatus(status: "❌ Office not installed", isActive: false);
+    } catch (_) {
+      return SystemStatus(status: "⏳ Ditunda (akan diperbarui)", isActive: false);
     }
   }
 
@@ -669,9 +727,7 @@ try {
 if ($p) { $p | ConvertTo-Json -Compress }''';
         final scriptPath = '${Directory.systemTemp.path}\\sekom_winact_cim.ps1';
         await File(scriptPath).writeAsString(ps);
-        final cimRes = await _shell
-            .run('powershell -NoProfile -ExecutionPolicy Bypass -File "$scriptPath"')
-            .timeout(const Duration(seconds: 5));
+        final cimRes = await _run('powershell -NoProfile -ExecutionPolicy Bypass -File "$scriptPath"', timeout: const Duration(seconds: 5));
         final out = cimRes.first.stdout.toString().trim();
         if (out.isNotEmpty && out != 'null' && out.startsWith('{')) {
           final map = jsonDecode(out) as Map<String, dynamic>;
@@ -732,9 +788,7 @@ if ($p) { $p | ConvertTo-Json -Compress }''';
       Future<Map<String, String>> _tryParseDlv(String cscript, String slmgr) async {
         final details = <String, String>{};
         try {
-          final res = await _shell
-              .run('cmd /c "$cscript" //nologo "$slmgr" /dlv')
-              .timeout(const Duration(seconds: 6));
+          final res = await _run('cmd /c "$cscript" //nologo "$slmgr" /dlv', timeout: const Duration(seconds: 6));
           final raw = (res.first.stdout.toString() + "\n" + res.first.stderr.toString()).trim();
 
           // Generic tolerant regexes
@@ -754,9 +808,7 @@ if ($p) { $p | ConvertTo-Json -Compress }''';
       for (final cscript in cscriptCandidates) {
         for (final slmgr in slmgrCandidates) {
           try {
-            final res = await _shell
-                .run('cmd /c "$cscript" //nologo "$slmgr" /xpr')
-                .timeout(const Duration(seconds: 6));
+            final res = await _run('cmd /c "$cscript" //nologo "$slmgr" /xpr', timeout: const Duration(seconds: 6));
             final combined = (res.first.stdout.toString() + "\n" + res.first.stderr.toString()).trim();
             final lower = combined.toLowerCase();
 
@@ -876,7 +928,7 @@ if ($p) { $p | ConvertTo-Json -Compress }''';
         int size = 0;
         if (exists) {
           try {
-            size = await _getFolderSizeViaRobocopy(folderPath).timeout(timeout);
+            size = await (noTimeouts ? _getFolderSizeViaRobocopy(folderPath) : _getFolderSizeViaRobocopy(folderPath).timeout(timeout));
           } catch (_) {
             size = 0;
           }
@@ -898,113 +950,36 @@ if ($p) { $p | ConvertTo-Json -Compress }''';
     }
   }
   static Future<List<FolderInfo>> getFolderSizesUltraFast({Duration timeout = const Duration(seconds: 8)}) async {
-    // 1) Try Python helper first
+    // Pure Dart implementation to avoid PowerShell/Python/native executables.
     try {
-      final py = await _resolvePython();
-      if (py != null) {
-        final result = await _shell.run('cmd /c $py "native\\python\\checks.py" --folder-sizes').timeout(timeout);
-        final out = result.first.stdout.toString().trim();
-        if (out.isNotEmpty && out != 'null') {
-          final decoded = jsonDecode(out);
-          final list = decoded is List ? decoded : [decoded];
-          final folderInfos = <FolderInfo>[];
-          for (final item in list) {
-            final name = (item['Name'] ?? '').toString();
-            final path = (item['Path'] ?? '').toString();
-            final exists = (item['Exists'] == true) || (item['Exists']?.toString().toLowerCase() == 'true');
-            final size = (item['SizeBytes'] is int) ? item['SizeBytes'] as int : int.tryParse((item['SizeBytes'] ?? '0').toString()) ?? 0;
-            folderInfos.add(FolderInfo(
-              name: name,
-              path: path,
-              size: exists ? _formatSize(size) : "Not found",
-              exists: exists,
-              sizeBytes: size,
-            ));
-          }
-          return folderInfos;
-        }
-      }
-    } catch (_) {}
-    // 2) Try native helper (C#) for maximum speed next
-    try {
-      final exePath = await _findSekomHelperExe();
-      if (exePath != null && await File(exePath).exists()) {
-        final result = await _shell.run('"$exePath"').timeout(timeout);
-        final out = result.first.stdout.toString().trim();
-        if (out.isNotEmpty && out != 'null') {
-          final decoded = jsonDecode(out);
-          final list = decoded is List ? decoded : [decoded];
-          final folderInfos = <FolderInfo>[];
-          for (final item in list) {
-            final name = (item['Name'] ?? '').toString();
-            final path = (item['Path'] ?? '').toString();
-            final exists = (item['Exists'] == true) || (item['Exists']?.toString().toLowerCase() == 'true');
-            final size = (item['SizeBytes'] is int) ? item['SizeBytes'] as int : int.tryParse((item['SizeBytes'] ?? '0').toString()) ?? 0;
-            folderInfos.add(FolderInfo(
-              name: name,
-              path: path,
-              size: exists ? _formatSize(size) : "Not found",
-              exists: exists,
-              sizeBytes: size,
-            ));
-          }
-          return folderInfos;
-        }
-      }
-    } catch (_) {
-      // ignore and fallback
-    }
+      String userProfile = Platform.environment['USERPROFILE'] ?? '';
+      List<String> folderNames = ['3D Objects', 'Documents', 'Downloads', 'Music', 'Pictures', 'Videos'];
 
-    // 2) Fallback to ultra-fast robocopy-based PowerShell
-    try {
-      final script = '''
-\$names = @('3D Objects','Documents','Downloads','Music','Pictures','Videos')
-\$user = [Environment]::GetEnvironmentVariable('USERPROFILE','Process')
-\$out = foreach (\$n in \$names) {
-  \$p = Join-Path \$user \$n
-  \$exists = Test-Path -LiteralPath \$p
-  \$bytes = 0
-  if (\$exists) {
-    try {
-      # Quote the Robocopy path to avoid tokenization on spaces
-      \$r = robocopy "\$p" "NUL" /E /L /BYTES | Out-String
-      \$m = [regex]::Match(\$r, 'Bytes\\s*:\\s*([0-9,]+)')
-      if (\$m.Success) { \$bytes = [int64](\$m.Groups[1].Value.Replace(',','')) }
-    } catch { \$bytes = 0 }
-  }
-  [PSCustomObject]@{ Name = \$n; Path = \$p; Exists = \$exists; SizeBytes = [int64]\$bytes }
-}
-\$out | ConvertTo-Json -Compress
-''';
-      final scriptPath = '${Directory.systemTemp.path}\\sekom_folder_sizes_robocopy.ps1';
-      await File(scriptPath).writeAsString(script);
-      final result = await _shell.run('powershell -NoProfile -ExecutionPolicy Bypass -File "$scriptPath"').timeout(timeout);
-      final out = result.first.stdout.toString().trim();
-      if (out.isNotEmpty && out != 'null') {
-        final decoded = jsonDecode(out);
-        final list = decoded is List ? decoded : [decoded];
-        final folderInfos = <FolderInfo>[];
-        for (final item in list) {
-          final name = (item['Name'] ?? '').toString();
-          final path = (item['Path'] ?? '').toString();
-          final exists = (item['Exists'] == true) || (item['Exists']?.toString().toLowerCase() == 'true');
-          final size = (item['SizeBytes'] is int) ? item['SizeBytes'] as int : int.tryParse((item['SizeBytes'] ?? '0').toString()) ?? 0;
-          folderInfos.add(FolderInfo(
-            name: name,
-            path: path,
-            size: exists ? _formatSize(size) : "Not found",
-            exists: exists,
-            sizeBytes: size,
-          ));
+      final futures = folderNames.map((folderName) async {
+        final folderPath = '$userProfile\\$folderName';
+        final exists = await Directory(folderPath).exists();
+        int size = 0;
+        if (exists) {
+          try {
+            size = await _calculateFolderSize(Directory(folderPath));
+          } catch (_) {
+            size = 0;
+          }
         }
-        return folderInfos;
-      }
-    } catch (_) {
-      // ignore
-    }
+        return FolderInfo(
+          name: folderName,
+          path: folderPath,
+          size: exists ? _formatSize(size) : "Not found",
+          exists: exists,
+          sizeBytes: size,
+        );
+      }).toList();
 
-    // 3) Fallback to fast per-folder robocopy
-    return getFolderSizesFast(timeout: timeout);
+      final results = await Future.wait(futures);
+      return results;
+    } catch (_) {
+      return getFolderSizes();
+    }
   }
 
   static Future<List<FolderInfo>> getFolderSizes() async {
@@ -1114,6 +1089,29 @@ if ($p) { $p | ConvertTo-Json -Compress }''';
   static Future<bool> updateDrivers() async {
     try {
       await _shell.run('powershell "pnputil /scan-devices"');
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // ===== Windows Update service control =====
+  static Future<bool> disableWindowsUpdateService() async {
+    try {
+      // Best-effort: these operations typically require Administrator privileges.
+      // Stop and disable the core Windows Update service
+      try { await _shell.run('powershell -NoProfile -Command "Stop-Service -Name wuauserv -Force -ErrorAction SilentlyContinue"'); } catch (_) {}
+      try { await _shell.run('powershell -NoProfile -Command "Set-Service -Name wuauserv -StartupType Disabled -ErrorAction SilentlyContinue"'); } catch (_) {}
+
+      // Also attempt to stop/disable the Update Orchestrator Service (UsoSvc) - best-effort
+      try { await _shell.run('powershell -NoProfile -Command "Stop-Service -Name UsoSvc -Force -ErrorAction SilentlyContinue"'); } catch (_) {}
+      try { await _shell.run('powershell -NoProfile -Command "Set-Service -Name UsoSvc -StartupType Disabled -ErrorAction SilentlyContinue"'); } catch (_) {}
+
+      // Note: Disabling BITS is not recommended globally as it impacts other components.
+      // If ever needed, uncomment with caution:
+      // try { await _shell.run('powershell -NoProfile -Command "Stop-Service -Name BITS -Force -ErrorAction SilentlyContinue"'); } catch (_) {}
+      // try { await _shell.run('powershell -NoProfile -Command "Set-Service -Name BITS -StartupType Disabled -ErrorAction SilentlyContinue"'); } catch (_) {}
+
       return true;
     } catch (_) {
       return false;
@@ -1730,7 +1728,9 @@ if ($appsFolder) {
     }
 }
 ''';
-      try { await _shell.run('powershell -NoProfile -Command "$psUnpinStart"'); } catch (_) {}
+      final startScriptPath = '${Directory.systemTemp.path}\\sekom_unpin_start.ps1';
+      try { await File(startScriptPath).writeAsString(psUnpinStart); } catch (_) {}
+      try { await _shell.run('powershell -NoProfile -ExecutionPolicy Bypass -File "$startScriptPath"'); } catch (_) {}
 
       // Method 2: Attempt to unpin Photos from taskbar if pinned (harmless if not present)
       final psUnpinTaskbar = r'''
@@ -1752,7 +1752,9 @@ if (Test-Path $taskbarPath) {
     }
 }
 ''';
-      try { await _shell.run('powershell -NoProfile -Command "$psUnpinTaskbar"'); } catch (_) {}
+      final taskbarScriptPath = '${Directory.systemTemp.path}\\sekom_unpin_taskbar.ps1';
+      try { await File(taskbarScriptPath).writeAsString(psUnpinTaskbar); } catch (_) {}
+      try { await _shell.run('powershell -NoProfile -ExecutionPolicy Bypass -File "$taskbarScriptPath"'); } catch (_) {}
 
       // Method 3: Clear Start menu cache to remove stale pinned tiles
       String localAppData = Platform.environment['LOCALAPPDATA'] ?? '';

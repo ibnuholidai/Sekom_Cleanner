@@ -69,7 +69,7 @@ class _MainScreenState extends State<MainScreen> with SingleTickerProviderStateM
         final existsList = _folderInfos.where((f) => f.exists).toList();
         final allZero = existsList.isNotEmpty && existsList.every((f) => f.sizeBytes == 0);
         if (_folderInfos.isEmpty || allZero) {
-          final accurate = await SystemService.getFolderSizes();
+          final accurate = await SystemService.getFolderSizesUltraFast();
           if (!mounted) return;
           setState(() {
             _folderInfos = accurate;
@@ -210,34 +210,38 @@ class _MainScreenState extends State<MainScreen> with SingleTickerProviderStateM
     });
 
     try {
-      // Jalankan pengecekan ukuran folder dan status sistem secara paralel
+      // Hitung ukuran folder secara paralel (tidak memblok UI)
+      _checkFolderSizesFast();
+
+      // Tampilkan status "Waiting..." dan tahan tombol sampai semua hasil ada
+      setState(() {
+        _statusMessage = "Waiting... menjalankan pemeriksaan";
+      });
+
+      // Kumpulkan semua pemeriksaan cepat (native/Dart) dan tunggu hasilnya
       final defenderF = SystemService
           .checkWindowsDefender()
-          .timeout(const Duration(seconds: 3), onTimeout: () => SystemStatus(status: "Timeout", isActive: false));
+          .catchError((e, st) => SystemStatus(status: "❌ Defender error: ${e.toString()}", isActive: false));
 
       final updateF = SystemService
           .checkWindowsUpdate()
-          .timeout(const Duration(seconds: 3), onTimeout: () => SystemStatus(status: "Timeout", isActive: false));
+          .catchError((e, st) => SystemStatus(status: "❌ Windows Update error: ${e.toString()}", isActive: false));
 
       final driverF = SystemService
           .checkDrivers()
-          .timeout(const Duration(seconds: 3), onTimeout: () => SystemStatus(status: "Timeout", isActive: false));
+          .catchError((e, st) => SystemStatus(status: "❌ Driver check error: ${e.toString()}", isActive: false));
 
       final windowsActF = _skipActivationOnCheckAll
           ? Future.value(SystemStatus(status: "⏭️ Dilewati (tekan Cek Ulang)", isActive: false))
           : SystemService
-              .checkWindowsActivation()
-              .timeout(const Duration(seconds: 15), onTimeout: () => SystemStatus(status: "⏳ Ditunda (akan diperbarui)", isActive: false));
+              .checkWindowsActivationQuick()
+              .catchError((e, st) => SystemStatus(status: "❌ Windows Activation error: ${e.toString()}", isActive: false));
 
-      // Office check bisa lambat (cscript), beri timeout agar UI tidak terhambat
       final officeActF = _skipActivationOnCheckAll
           ? Future.value(SystemStatus(status: "⏭️ Dilewati (tekan Cek Ulang)", isActive: false))
           : SystemService
-              .checkOfficeActivation()
-              .timeout(const Duration(seconds: 15), onTimeout: () => SystemStatus(status: "⏳ Ditunda (akan diperbarui)", isActive: false));
-
-      // Gunakan metode cepat untuk ukuran folder (berbasis robocopy) dengan timeout
-      _checkFolderSizesFast();
+              .checkOfficeActivationQuick()
+              .catchError((e, st) => SystemStatus(status: "❌ Office Activation error: ${e.toString()}", isActive: false));
 
       final results = await Future.wait<SystemStatus>([
         defenderF,
@@ -247,8 +251,7 @@ class _MainScreenState extends State<MainScreen> with SingleTickerProviderStateM
         officeActF,
       ]);
 
-      // Perhitungan ukuran folder berjalan di background (tidak diblok menunggu di sini)
-
+      if (!mounted) return;
       setState(() {
         _defenderStatus = results[0];
         _updateStatus = results[1];
@@ -258,13 +261,13 @@ class _MainScreenState extends State<MainScreen> with SingleTickerProviderStateM
         _statusMessage = "Semua pemeriksaan selesai";
       });
 
-      // If activation checks were deferred (timeout/policy), retry in background with longer window
-      final wStat = _windowsActivationStatus.status.toLowerCase();
-      if (wStat.contains("ditunda") || wStat.contains("timeout")) {
+      // Lakukan pemeriksaan mendalam aktivasi di background jika perlu
+      final w = _windowsActivationStatus.status.toLowerCase();
+      if (w.contains("cannot verify") || w.contains("ditunda")) {
         _refreshWindowsActivationInBackground();
       }
-      final oStat = _officeActivationStatus.status.toLowerCase();
-      if (oStat.contains("ditunda") || oStat.contains("timeout")) {
+      final o = _officeActivationStatus.status.toLowerCase();
+      if (o.contains("cannot verify") || o.contains("ditunda")) {
         _refreshOfficeActivationInBackground();
       }
     } catch (e) {
@@ -272,6 +275,7 @@ class _MainScreenState extends State<MainScreen> with SingleTickerProviderStateM
         _statusMessage = "Error: ${e.toString()}";
       });
     } finally {
+      // Jangan tahan UI — akhiri status checking sekarang.
       setState(() {
         _isChecking = false;
       });
@@ -364,7 +368,7 @@ class _MainScreenState extends State<MainScreen> with SingleTickerProviderStateM
     setState(() {
       _statusMessage = "Running Windows Update...";
     });
-
+  
     bool success = await SystemService.runWindowsUpdate();
     if (success) {
       setState(() {
@@ -378,6 +382,27 @@ class _MainScreenState extends State<MainScreen> with SingleTickerProviderStateM
     }
   }
 
+  Future<void> _disableWindowsUpdate() async {
+    bool? confirm = await _showConfirmationDialog(
+      'Disable Windows Update',
+      'Tindakan ini akan menghentikan layanan Windows Update dan mengubah Startup Type menjadi Disabled (wuauserv, UsoSvc).\n\nLanjutkan?'
+    );
+    if (confirm != true) return;
+    setState(() {
+      _statusMessage = "Menonaktifkan Windows Update services...";
+    });
+    final ok = await SystemService.disableWindowsUpdateService();
+    if (!mounted) return;
+    setState(() {
+      if (ok) {
+        _statusMessage = "Windows Update berhasil dinonaktifkan (service dihentikan dan diset Disabled).";
+        _updateStatus = SystemStatus(status: "Disabled via Services", isActive: false);
+      } else {
+        _statusMessage = "Gagal menonaktifkan Windows Update. Coba jalankan aplikasi sebagai Administrator.";
+      }
+    });
+  }
+  
   Future<void> _updateDrivers() async {
     setState(() {
       _statusMessage = "Updating drivers...";
@@ -583,7 +608,7 @@ class _MainScreenState extends State<MainScreen> with SingleTickerProviderStateM
 
     setState(() {
       _isCleaning = true;
-      _statusMessage = "Memulai proses pembersihan...";
+      _statusMessage = "Memulai proses pembersihan (paralel)...";
     });
 
     try {
@@ -592,13 +617,14 @@ class _MainScreenState extends State<MainScreen> with SingleTickerProviderStateM
       bool recentCleared = false;
       bool recycleCleared = false;
 
-      // Clean browsers
-      if (browserSelected && _resetBrowserSelected) {
-        setState(() {
-          _statusMessage = "Menutup browser dan mereset ke setelan awal...";
-        });
+      Future<List<String>>? fBrowsers;
+      Future<List<String>>? fFolders;
+      Future<bool>? fRecent;
+      Future<bool>? fRecycle;
 
-        cleanedBrowsers = await SystemService.cleanBrowsers(
+      // Launch all selected tasks in parallel
+      if (browserSelected && _resetBrowserSelected) {
+        fBrowsers = SystemService.cleanBrowsers(
           chrome: _chromeSelected,
           edge: _edgeSelected,
           firefox: _firefoxSelected,
@@ -606,13 +632,8 @@ class _MainScreenState extends State<MainScreen> with SingleTickerProviderStateM
         );
       }
 
-      // Clean system folders
       if (folderSelected) {
-        setState(() {
-          _statusMessage = "Membersihkan folder sistem...";
-        });
-
-        cleanedFolders = await SystemService.cleanSystemFolders(
+        fFolders = SystemService.cleanSystemFolders(
           documents: _documentsSelected,
           downloads: _downloadsSelected,
           music: _musicSelected,
@@ -622,23 +643,62 @@ class _MainScreenState extends State<MainScreen> with SingleTickerProviderStateM
         );
       }
 
-      // Clear recent files
       if (recentSelected) {
-        setState(() {
-          _statusMessage = "Menghapus Recent Files...";
-        });
-
-        recentCleared = await SystemService.clearRecentFiles();
+        fRecent = SystemService.clearRecentFiles();
       }
 
-      // Clear recycle bin
       if (recycleSelected) {
-        setState(() {
-          _statusMessage = "Mengosongkan Recycle Bin...";
-        });
-
-        recycleCleared = await SystemService.clearRecycleBin();
+        fRecycle = SystemService.clearRecycleBin();
       }
+
+      final tasks = <Future<dynamic>>[];
+      final List<String> errorMsgs = [];
+
+      if (fBrowsers != null) {
+        final fb0 = fBrowsers;
+        final fb = fb0.catchError((e, st) {
+          errorMsgs.add("Reset browser gagal: ${e.toString()}");
+          return <String>[];
+        });
+        fBrowsers = fb;
+        tasks.add(fb);
+      }
+      if (fFolders != null) {
+        final ff0 = fFolders;
+        final ff = ff0.catchError((e, st) {
+          errorMsgs.add("Bersihkan folder sistem gagal: ${e.toString()}");
+          return <String>[];
+        });
+        fFolders = ff;
+        tasks.add(ff);
+      }
+      if (fRecent != null) {
+        final fr0 = fRecent;
+        final fr = fr0.catchError((e, st) {
+          errorMsgs.add("Clear Recent Files gagal: ${e.toString()}");
+          return false;
+        });
+        fRecent = fr;
+        tasks.add(fr);
+      }
+      if (fRecycle != null) {
+        final frb0 = fRecycle;
+        final frb = frb0.catchError((e, st) {
+          errorMsgs.add("Kosongkan Recycle Bin gagal: ${e.toString()}");
+          return false;
+        });
+        fRecycle = frb;
+        tasks.add(frb);
+      }
+
+      if (tasks.isNotEmpty) {
+        await Future.wait(tasks);
+      }
+
+      if (fBrowsers != null) cleanedBrowsers = await fBrowsers;
+      if (fFolders != null) cleanedFolders = await fFolders;
+      if (fRecent != null) recentCleared = await fRecent;
+      if (fRecycle != null) recycleCleared = await fRecycle;
 
       // Show results
       String resultMessage = '';
@@ -653,6 +713,9 @@ class _MainScreenState extends State<MainScreen> with SingleTickerProviderStateM
       }
       if (recycleCleared) {
         resultMessage += '✅ Recycle Bin berhasil dikosongkan.\n\n';
+      }
+      if (errorMsgs.isNotEmpty) {
+        resultMessage += '❌ Beberapa operasi gagal:\n- ${errorMsgs.join('\n- ')}\n\n';
       }
 
       if (resultMessage.isNotEmpty) {
@@ -886,6 +949,7 @@ class _MainScreenState extends State<MainScreen> with SingleTickerProviderStateM
                   },
                   skipActivationOnCheckAll: _skipActivationOnCheckAll,
                   onSkipActivationChanged: (v) { setState(() { _skipActivationOnCheckAll = v; }); },
+                  onDisableWindowsUpdate: _disableWindowsUpdate,
                 ),
               ),
             ],

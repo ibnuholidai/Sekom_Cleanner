@@ -24,6 +24,7 @@ class WindowsSystemSection extends StatefulWidget {
   final Function() onRecheckActivation;
   final bool skipActivationOnCheckAll;
   final Function(bool) onSkipActivationChanged;
+  final Function() onDisableWindowsUpdate; // NEW: disable Windows Update via Services
 
   const WindowsSystemSection({
     super.key,
@@ -49,6 +50,7 @@ class WindowsSystemSection extends StatefulWidget {
     required this.onRecheckActivation,
     required this.skipActivationOnCheckAll,
     required this.onSkipActivationChanged,
+    required this.onDisableWindowsUpdate,
   });
 
   @override
@@ -104,6 +106,20 @@ class _WindowsSystemSectionState extends State<WindowsSystemSection> {
               'Update',
               onOpen: widget.onOpenWindowsUpdateSettings,
               openText: 'Lihat',
+            ),
+            SizedBox(height: 6),
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton.icon(
+                onPressed: widget.isChecking ? null : widget.onDisableWindowsUpdate,
+                icon: Icon(Icons.block),
+                label: Text('Disable Windows Update (Stop + Disable Service)'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.red.shade600,
+                  foregroundColor: Colors.white,
+                  padding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                ),
+              ),
             ),
             _buildSystemStatusRow(
               'Drivers',
